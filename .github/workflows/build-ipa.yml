@@ -1,0 +1,80 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack zip
+        run: |
+          Z=$(ls -t *.zip 2>/dev/null | head -1)
+          if [ -n "$Z" ]; then
+            echo "Unpacking $Z"
+            unzip -o -q "$Z" -d _src
+            D=$(dirname "$(find _src -maxdepth 3 -name Cargo.toml | head -1)")
+            cp -R "$D"/. .
+            rm -rf _src
+          fi
+          ls -la
+          test -f Cargo.toml || { echo "Cargo.toml not found - upload the project zip"; exit 1; }
+
+      - name: Rust toolchain (iOS)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Rust core (static lib)
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+        run: |
+          cargo rustc -p wave-core --lib --release --target aarch64-apple-ios --crate-type staticlib
+          rm -f target/aarch64-apple-ios/release/libwavenode.dylib
+          ls -la target/aarch64-apple-ios/release/ | grep wavenode
+
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          cd ios && xcodegen generate
+
+      - name: Build app (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild -project ios/Wave.xcodeproj -scheme Wave -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee xcode.log | tail -n 200 || { grep -n "error:" xcode.log | head -40; exit 65; }
+
+      - name: Package IPA
+        run: |
+          rm -rf Payload Wave.ipa
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/Wave.app Payload/
+          zip -qry Wave.ipa Payload
+          ls -la Wave.ipa
+          echo "VER=$(grep MARKETING_VERSION ios/project.yml | head -1 | sed 's/[^0-9.]//g')" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Wave-${{ env.VER }}-ipa
+          path: Wave.ipa
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VER }}-${{ github.run_number }}
+          name: Wave ${{ env.VER }} (build ${{ github.run_number }})
+          files: Wave.ipa
